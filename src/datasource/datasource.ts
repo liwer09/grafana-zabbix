@@ -753,8 +753,11 @@ export class ZabbixDatasource extends DataSourceApi<ZabbixMetricsQuery, ZabbixDS
       .then((problems) => problemsHandler.addTriggerHostProxy(problems, proxies));
 
     return problemsPromises.then((problems) => {
-      const problemsDataFrame = problemsHandler.toDataFrame(problems, target);
-      return problemsDataFrame;
+      // --- Aquí se aplica el enriquecimiento de cada evento para incluir r_clock ---
+      return Promise.all(problems.map(p => this.enrichEvent(p))).then((enrichedProblems) => {
+        const problemsDataFrame = problemsHandler.toDataFrame(enrichedProblems, target);
+        return problemsDataFrame;
+      });
     });
   }
 
@@ -927,26 +930,30 @@ export class ZabbixDatasource extends DataSourceApi<ZabbixMetricsQuery, ZabbixDS
     return this.zabbix
       .getProblemsHistory(groupFilter, hostFilter, appFilter, proxyFilter, problemsOptions)
       .then((problems) => {
+        // --- Enriquecemos cada evento (problema) para incluir r_clock ---
+        return Promise.all(problems.map(p => this.enrichEvent(p)));
+      })
+      .then((enrichedProblems) => {
         // Filter triggers by description
         const problemName = this.replaceTemplateVars(annotation.trigger.filter, {});
         if (utils.isRegex(problemName)) {
-          problems = _.filter(problems, (p) => {
+          enrichedProblems = _.filter(enrichedProblems, (p) => {
             return utils.buildRegex(problemName).test(p.description);
           });
         } else if (problemName) {
-          problems = _.filter(problems, (p) => {
+          enrichedProblems = _.filter(enrichedProblems, (p) => {
             return p.description === problemName;
           });
         }
 
         // Hide acknowledged events if option enabled
         if (annotation.hideAcknowledged) {
-          problems = _.filter(problems, (p) => {
+          enrichedProblems = _.filter(enrichedProblems, (p) => {
             return !p.acknowledges?.length;
           });
         }
 
-        return _.map(problems, (p) => {
+        return _.map(enrichedProblems, (p) => {
           const formattedAcknowledges = utils.formatAcknowledges(p.acknowledges);
 
           let annotationTags: string[] = [];
@@ -958,7 +965,7 @@ export class ZabbixDatasource extends DataSourceApi<ZabbixMetricsQuery, ZabbixDS
             title: p.value === '1' ? 'Problem' : 'OK',
             time: p.timestamp * 1000,
             annotation: annotation,
-            text: p.name + formattedAcknowledges,
+            text: p.name + formattedAcknowledges + (p.r_clock ? ' (r_clock: ' + p.r_clock + ')' : ''),
             tags: annotationTags,
           };
         });
@@ -1018,6 +1025,89 @@ export class ZabbixDatasource extends DataSourceApi<ZabbixMetricsQuery, ZabbixDS
   isDBConnectionTarget = (target: any): boolean => {
     return this.enableDirectDBConnection && (target.queryType === c.MODE_METRICS || target.queryType === c.MODE_ITEMID);
   };
+
+  // --- NUEVAS FUNCIONES PARA ENRIQUECER EVENTOS CON r_clock ---
+
+  /**
+   * Enriquecer un evento con el campo r_clock realizando llamadas adicionales según:
+   * - Si r_eventid es "0": se consulta c_eventid (si existe y es distinto de "0") y se asigna su clock.
+   * - Si r_eventid es distinto de "0": se consulta el evento de recuperación; y si éste tiene a su vez un r_eventid distinto de "0",
+   *   se hace una segunda consulta para obtener el clock final.
+   * Se convierte el valor de clock de segundos a milisegundos.
+   *
+   * @param event Objeto evento original.
+   * @returns Promesa que resuelve en el evento enriquecido.
+   */
+  async enrichEvent(event: any): Promise<any> {
+    // Convertir clock a milisegundos, si existe
+    if (event.clock) {
+      event.clock = Number(event.clock) * 1000;
+    }
+    // Caso 1: r_eventid es "0": buscar c_eventid
+    if (event.r_eventid === "0") {
+      if (event.c_eventid && event.c_eventid !== "0") {
+        try {
+          const childEvent = await this.fetchEventById(event.c_eventid);
+          if (childEvent && childEvent.clock) {
+            event.r_clock = Number(childEvent.clock) * 1000;
+          }
+        } catch (error) {
+          console.error(`Error fetching event for c_eventid ${event.c_eventid}:`, error);
+        }
+      }
+    } else {
+      // Caso 2: r_eventid es distinto de "0": consultar el evento de recuperación
+      try {
+        const recoveryEvent = await this.fetchEventById(event.r_eventid);
+        if (recoveryEvent) {
+          if (recoveryEvent.r_eventid && recoveryEvent.r_eventid !== "0") {
+            try {
+              const furtherRecoveryEvent = await this.fetchEventById(recoveryEvent.r_eventid);
+              if (furtherRecoveryEvent && furtherRecoveryEvent.clock) {
+                event.r_clock = Number(furtherRecoveryEvent.clock) * 1000;
+              }
+            } catch (error) {
+              console.error(`Error fetching event for further r_eventid ${recoveryEvent.r_eventid}:`, error);
+            }
+          } else {
+            if (recoveryEvent.clock) {
+              event.r_clock = Number(recoveryEvent.clock) * 1000;
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`Error fetching event for r_eventid ${event.r_eventid}:`, error);
+      }
+    }
+    return event;
+  }
+
+  /**
+   * Realiza una consulta a la API de Zabbix para obtener un evento a partir de su eventid.
+   *
+   * @param eventId ID del evento a consultar.
+   * @returns Promesa que resuelve en el evento obtenido o null.
+   */
+  fetchEventById(eventId: string): Promise<any> {
+    const params = {
+      eventids: eventId,
+    };
+    return getBackendSrv().fetch({
+      url: '/api/ds/query',
+      method: 'POST',
+      data: {
+        jsonrpc: '2.0',
+        method: 'event.get',
+        params: params,
+        id: 1,
+      },
+    }).toPromise().then((response) => {
+      if (response.data && response.data.result && response.data.result.length > 0) {
+        return response.data.result[0];
+      }
+      return null;
+    });
+  }
 }
 
 function bindFunctionDefs(functionDefs, category) {
@@ -1122,4 +1212,4 @@ const getTriggersOptions = (target: ZabbixMetricsQuery, timeRange) => {
     options.timeTo = timeTo;
   }
   return options;
-};
+}
